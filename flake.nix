@@ -10,7 +10,6 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        # Image is always Linux. On macOS cross-compile to aarch64-linux so no Linux builder is needed.
         mkApp = p: p.rustPlatform.buildRustPackage {
           pname = "gphotosync";
           version = "0.1.0";
