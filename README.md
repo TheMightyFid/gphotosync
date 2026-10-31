@@ -11,7 +11,7 @@ cron: each run picks up where the last one stopped.
    Netscape `cookies.txt` format (e.g. with the "Get cookies.txt LOCALLY" extension). Then close the
    window *without signing out*. If you keep using that session in a browser, Google rotates the
    cookies and the exported copy goes stale.
-2. Build the image (Linux; on macOS this needs a Linux builder, see below):
+2. Build the image (works on Linux and macOS, see "Images" below):
    ```sh
    nix build .#docker && docker load < result
    ```
@@ -68,6 +68,21 @@ Items that fail are retried on later runs, after the ones that have never been t
 This relies on undocumented internal endpoints (see `docs/rpc-spec.md`), so a Google UI change can break it.
 Storage-saver items only exist in their compressed form.
 
-## macOS: building the image
+## Images
 
-`nix build .#docker` needs an `aarch64-linux` builder. With nix-darwin, set `nix.linux-builder.enable = true;`.
+`nix build .#docker` builds an image for the host architecture (aarch64 when built on macOS, via cross-compilation).
+`nix build .#docker-amd64` always builds an x86_64 image, which is what Unraid and most NAS boxes need.
+
+## Unraid
+
+1. Build and copy the image across: `nix build .#docker-amd64 && scp result root@tower:/tmp/gphotosync.tar.gz`.
+   Then, on Unraid, run `docker load < /tmp/gphotosync.tar.gz`.
+2. `cp unraid/gphotosync.xml /boot/config/plugins/dockerMan/templates-user/my-gphotosync.xml`.
+3. Put `cookies.txt` in `/mnt/user/appdata/gphotosync/`. In **Docker → Add Container**, pick the
+   `gphotosync` template, check the paths and click Apply. The container runs one sync and exits. The
+   template runs it as `nobody:users` (99:100), so the backup share must be writable by that user.
+4. Schedule it with the **User Scripts** plugin (custom cron, e.g. `17 3 * * *`):
+   ```sh
+   #!/bin/bash
+   docker start -a gphotosync
+   ```

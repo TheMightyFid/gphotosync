@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<!-- Unraid Docker template. Copy to /boot/config/plugins/dockerMan/templates-user/my-gphotosync.xml,
+     then Docker > Add Container > Template: gphotosync. See README "Unraid". -->
+<Container version="2">
+  <Name>gphotosync</Name>
+  <Repository>gphotosync:latest</Repository>
+  <Registry/>
+  <Network>bridge</Network>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/TheMightyFid/gphotosync</Support>
+  <Project>https://github.com/TheMightyFid/gphotosync</Project>
+  <Overview>Resumable Google Photos backup: original-quality photos, videos, Live-photo videos, albums and metadata. Runs once and exits; schedule it with the User Scripts plugin (docker start gphotosync).</Overview>
+  <Category>Backup: Tools:</Category>
+  <!-- nobody:users, so files on the array get Unraid's usual ownership. -->
+  <ExtraParams>--user 99:100</ExtraParams>
+  <PostArgs/>
+  <Config Name="Backup" Target="/data" Default="/mnt/user/photos/gphotosync" Mode="rw" Description="Where media, album links and the resume state (state.db) are stored." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/photos/gphotosync</Config>
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/gphotosync" Mode="ro" Description="Folder containing cookies.txt exported from a private browser window signed in to photos.google.com." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/gphotosync</Config>
+  <Config Name="Account index" Target="GPS_ACCOUNT" Default="0" Mode="" Description="/u/N/ account index when several Google accounts are in the cookies." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
+  <Config Name="RPC delay (ms)" Target="GPS_DELAY_MS" Default="500" Mode="" Description="Minimum gap between Google API calls. Raise if you get rate limited (exit code 75)." Type="Variable" Display="advanced" Required="false" Mask="false">500</Config>
+  <Config Name="Back up albums" Target="GPS_ALBUMS" Default="1" Mode="" Description="1 to index albums into /data/albums, 0 to skip." Type="Variable" Display="advanced" Required="false" Mask="false">1</Config>
+</Container>
