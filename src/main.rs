@@ -67,6 +67,13 @@ async fn run() -> Result<()> {
     let jar = Jar::parse(&std::fs::read_to_string(src).with_context(|| format!("reading {}", src.display()))?);
 
     let mut db = Db::open(&data.join("state.db"))?;
+    // After a block, back off across runs: hammering again at the next cron tick escalates Google's response.
+    if let Some(until) = db.get("blocked_until")?.and_then(|v| v.parse::<i64>().ok())
+        && until > now_ms()
+    {
+        log!("cooling down after a block until {}, skipping this run", stamp(until));
+        return Ok(());
+    }
     let (total, done) = db.counts()?;
     log!("state: {done}/{total} backed up ({:.1}%), {} failing", pct(done, total), db.failing()?);
     db.set("run_start", Some(&now_ms().to_string()))?;
@@ -89,6 +96,15 @@ async fn run() -> Result<()> {
             res.and(saved_jar)
         }
     };
+    // Escalating cooldown: 1h, 4h, 24h, then 72h for repeat blocks; cleared by a run that isn't blocked.
+    let blocked = res.as_ref().err().and_then(|e| e.downcast_ref::<Fatal>()).is_some_and(|f| matches!(f, Fatal::Blocked(_)));
+    let strikes = if blocked { db.get("block_strikes")?.and_then(|v| v.parse().ok()).unwrap_or(0) + 1 } else { 0 };
+    db.set("block_strikes", Some(&strikes.to_string()))?;
+    let hours = [0, 1, 4, 24, 72][strikes.min(4)];
+    db.set("blocked_until", blocked.then(|| (now_ms() + hours * 3_600_000).to_string()).as_deref())?;
+    if blocked {
+        log!("blocked (strike {strikes}): next run allowed after {}", stamp(now_ms() + hours * 3_600_000));
+    }
     let outcome = match &res {
         Ok(()) => "finished".to_string(),
         Err(e) => match (e.downcast_ref::<Fatal>(), signal) {
@@ -213,12 +229,25 @@ async fn download(gp: &mut Client, db: &mut Db, data: &Path, st: &mut Stats) -> 
     // Items that failed this run; they stay pending, so over-fetch by that many to always see untried ones.
     let mut tried = HashSet::new();
     let mut consecutive_failures = 0;
+    // Spread a big first sync over several runs instead of one 30h burst (docs/bot-risk.md). 0 = unlimited.
+    let max_items: u64 = env("GPS_MAX_ITEMS", "2000").parse().context("GPS_MAX_ITEMS")?;
+    let mut next_pause = gphotos::jitter(50.0, 200.0) as u64;
     loop {
         let batch: Vec<_> = db.pending(200 + tried.len())?.into_iter().filter(|i| !tried.contains(&i.key)).collect();
         if batch.is_empty() {
             return Ok(());
         }
         for item in batch {
+            if max_items > 0 && st.items >= max_items {
+                log!("reached GPS_MAX_ITEMS={max_items} for this run; the rest resumes next run");
+                return Ok(());
+            }
+            if st.items >= next_pause {
+                let secs = gphotos::jitter(30.0, 180.0) as u64;
+                log!("pausing {secs}s");
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                next_pause = st.items + gphotos::jitter(50.0, 200.0) as u64;
+            }
             match download_one(gp, &item, data).await {
                 Ok((path, size)) => {
                     consecutive_failures = 0;
@@ -292,7 +321,11 @@ async fn fetch_to(gp: &mut Client, url: &str, path: &Path) -> Result<u64> {
     }
     // An expired URL or interstitial can come back as a 200 HTML page (even via photos.google.com).
     if resp.headers().get(reqwest::header::CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"text/html")) {
-        bail!("got HTML instead of media from {}", resp.url());
+        let url = resp.url().to_string();
+        if gphotos::is_captcha(&resp.text().await.unwrap_or_default()) {
+            Err(Fatal::Blocked(format!("captcha instead of media from {url}")))?
+        }
+        bail!("got HTML instead of media from {url}");
     }
     let part = PathBuf::from(format!("{}.part", path.display()));
     let mut f = tokio::fs::File::create(&part).await?;
@@ -447,6 +480,11 @@ fn status() -> Result<()> {
             println!("           {} downloaded ({}), {} failed", kv("run_items")?, fmt_bytes(bytes), kv("run_failed")?);
         }
     }
+    if let Ok(until) = kv("blocked_until")?.parse::<i64>()
+        && until > now_ms()
+    {
+        println!("cooldown:  blocked by Google, next run allowed after {}", stamp(until));
+    }
     Ok(())
 }
 
@@ -486,5 +524,14 @@ mod tests {
         assert_eq!(rate_eta(5, 10, 0), (18_000, "2s".into())); // sub-second start: no division by zero
         assert_eq!(rate_eta(41, 123, 3600), (41, "3h00m".into()));
         assert_eq!(pct(0, 0), 100.0);
+    }
+
+    #[test]
+    fn jitter_range() {
+        for _ in 0..1000 {
+            let j = gphotos::jitter(0.6, 1.8);
+            assert!((0.6..1.8).contains(&j), "{j}");
+        }
+        assert_ne!(gphotos::jitter(0.0, 1.0), gphotos::jitter(0.0, 1.0));
     }
 }

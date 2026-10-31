@@ -18,5 +18,6 @@
   <Config Name="Config" Target="/config" Default="/mnt/user/appdata/gphotosync" Mode="ro" Description="Folder containing cookies.txt exported from a private browser window signed in to photos.google.com." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/gphotosync</Config>
   <Config Name="Account index" Target="GPS_ACCOUNT" Default="0" Mode="" Description="/u/N/ account index when several Google accounts are in the cookies." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
   <Config Name="RPC delay (ms)" Target="GPS_DELAY_MS" Default="500" Mode="" Description="Minimum gap between Google API calls. Raise if you get rate limited (exit code 75)." Type="Variable" Display="advanced" Required="false" Mask="false">500</Config>
+  <Config Name="Max items per run" Target="GPS_MAX_ITEMS" Default="2000" Mode="" Description="Downloads per run (0 = unlimited). Keeps a large first sync spread over several nights to avoid Google rate limits." Type="Variable" Display="advanced" Required="false" Mask="false">2000</Config>
   <Config Name="Back up albums" Target="GPS_ALBUMS" Default="1" Mode="" Description="1 to index albums into /data/albums, 0 to skip." Type="Variable" Display="advanced" Required="false" Mask="false">1</Config>
 </Container>

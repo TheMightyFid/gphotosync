@@ -7,7 +7,9 @@ cron: each run picks up where the last one stopped.
 
 ## Setup
 
-1. Open a **private/incognito** window, sign in at https://photos.google.com, and export its cookies in
+1. Prefer **Firefox** (or Chrome on Linux). Recent Chrome on Windows and macOS binds sessions to the device
+   (DBSC), so exported cookies may stop working within minutes. Open a **private** window, sign in at
+   https://photos.google.com, and export its cookies in
    Netscape `cookies.txt` format (e.g. with the "Get cookies.txt LOCALLY" extension). Then close the
    window *without signing out*. If you keep using that session in a browser, Google rotates the
    cookies and the exported copy goes stale.
@@ -34,8 +36,9 @@ Without Docker: `nix run . ` or `cargo run --release`.
 | `GPS_DATA` | `./backup` (`/data` in the image) | output + state directory |
 | `GPS_COOKIES` | `./cookies.txt` (`/config/cookies.txt`) | exported cookies |
 | `GPS_ACCOUNT` | `0` | `/u/N/` account index when several are signed in |
-| `GPS_DELAY_MS` | `500` | minimum gap between RPCs |
+| `GPS_DELAY_MS` | `500` | base gap between RPCs (randomised 0.6-1.8x) |
 | `GPS_ALBUMS` | `1` | set to `0` to skip album indexing |
+| `GPS_MAX_ITEMS` | `2000` | max downloads per run (`0` = unlimited); spreads a big first sync over several nights |
 
 ## Output
 
@@ -93,12 +96,18 @@ is safe. A `.lock` file stops overlapping cron runs.
 | code | meaning |
 |---|---|
 | 0 | done (or another run already in progress) |
-| 75 | rate limited / captcha. Stopped early; the next run resumes |
+| 75 | rate limited / captcha. Stopped early. Later runs are skipped for 1 h, then 4 h, 24 h, then 72 h for repeat blocks, and then it resumes |
 | 77 | session expired. Re-export the cookies |
 | 1 | other error |
 
 Items that fail are retried on later runs, after the ones that have never been tried. `sqlite3 state.db
 "select key,attempts,last_error from items where path is null and attempts>0"` lists them.
+
+## Avoiding blocks
+
+Google publishes no limits for these endpoints. See `docs/bot-risk.md` for the assessment. The defaults
+(jittered delays, random pauses, 2000 items per run, escalating cooldown) aim to keep traffic human-scale.
+Run it from your home network rather than a VPS, and never use the exported session in a browser.
 
 ## Caveats
 

@@ -7,7 +7,20 @@ use reqwest::{Response, StatusCode, Url};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
-const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+// ponytail: bump occasionally; a year-stale Chrome version is itself a bot signal (docs/bot-risk.md).
+const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+
+/// Random factor in [lo, hi) without a rand dependency: std's RandomState is randomly keyed per process.
+pub fn jitter(lo: f64, hi: f64) -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+    let r = std::hash::RandomState::new().build_hasher().finish();
+    lo + (hi - lo) * (r >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Captcha / "unusual traffic" interstitial markers.
+pub fn is_captcha(body: &str) -> bool {
+    body.contains("unusual traffic") || body.contains("g-recaptcha") || body.contains("/sorry/index")
+}
 
 /// Conditions where continuing is pointless; the run stops and state is kept for next time.
 #[derive(Debug)]
@@ -127,7 +140,7 @@ impl Client {
             Err(Fatal::SignedOut(format!("{} redirected to {}: account not in cookies", self.base, resp.url())))?
         }
         let html = resp.text().await?;
-        if html.contains("unusual traffic") || html.contains("g-recaptcha") {
+        if is_captcha(&html) {
             Err(Fatal::Blocked("captcha page on photos.google.com".into()))?
         }
         let g = wiz_global_data(&html)
@@ -153,15 +166,25 @@ impl Client {
         let mut form = form;
         for _ in 0..10 {
             let host = url.host_str().unwrap_or_default().to_string();
+            // Roughly what Chrome sends: XHR-style for RPCs, plain navigation-less GET for media (no Origin).
             let rb = match form {
-                Some(f) => self.http.post(url.clone()).form(f).header("x-same-domain", "1"),
-                None => self.http.get(url.clone()),
+                Some(f) => self
+                    .http
+                    .post(url.clone())
+                    .form(f)
+                    .header("x-same-domain", "1")
+                    .header("origin", "https://photos.google.com")
+                    .header("sec-fetch-mode", "cors")
+                    .header("sec-fetch-dest", "empty"),
+                None => self.http.get(url.clone()).header("sec-fetch-mode", "no-cors").header("sec-fetch-dest", "empty"),
             };
             let resp = rb
                 .header(COOKIE, self.jar.header(&host))
                 .header(USER_AGENT, UA)
-                .header("origin", "https://photos.google.com")
+                .header("accept", "*/*")
+                .header("accept-language", "en-US,en;q=0.9")
                 .header("referer", "https://photos.google.com/")
+                .header("sec-fetch-site", if host == "photos.google.com" { "same-origin" } else { "cross-site" })
                 .send()
                 .await?;
             self.jar.absorb(&resp, &host);
@@ -194,7 +217,8 @@ impl Client {
         let freq = json!([[[rpcid, payload.to_string(), null, "generic"]]]).to_string();
         let mut last = anyhow!("unreachable");
         for attempt in 1..=4u32 {
-            if let Some(wait) = self.delay.checked_sub(self.last_rpc.elapsed()) {
+            // Jittered gap: perfectly periodic requests are the easiest bot signal to spot.
+            if let Some(wait) = self.delay.mul_f64(jitter(0.6, 1.8)).checked_sub(self.last_rpc.elapsed()) {
                 tokio::time::sleep(wait).await;
             }
             self.last_rpc = Instant::now();
@@ -311,7 +335,7 @@ pub fn wiz_global_data(html: &str) -> Option<Value> {
 /// its double-encoded payload.
 pub fn parse_batch(body: &str, rpcid: &str) -> Result<Value> {
     // Only non-batchexecute bodies: a real payload can contain these words in a user's photo description.
-    if !body.starts_with(")]}'") && (body.contains("unusual traffic") || body.contains("g-recaptcha")) {
+    if !body.starts_with(")]}'") && is_captcha(body) {
         Err(Fatal::Blocked("captcha page".into()))?
     }
     for line in body.lines().filter(|l| l.contains("wrb.fr")) {
