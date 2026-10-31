@@ -19,6 +19,7 @@ cron: each run picks up where the last one stopped.
    ```sh
    docker run --rm -v /srv/photos:/data -v /srv/gphotosync:/config:ro gphotosync:latest
    ```
+   The image runs as uid/gid 1000:1000, so `/srv/photos` must be writable by it (or pass `--user`).
    Cron, e.g. nightly:
    ```cron
    17 3 * * * docker run --rm -v /srv/photos:/data -v /srv/gphotosync:/config:ro gphotosync:latest >> /var/log/gphotosync.log 2>&1

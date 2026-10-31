@@ -11,7 +11,6 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         # Image is always Linux. On macOS cross-compile to aarch64-linux so no Linux builder is needed.
-        lpkgs = if pkgs.stdenv.isDarwin then pkgs.pkgsCross.aarch64-multiplatform else pkgs;
         mkApp = p: p.rustPlatform.buildRustPackage {
           pname = "gphotosync";
           version = "0.1.0";
