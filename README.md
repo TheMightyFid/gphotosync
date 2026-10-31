@@ -48,6 +48,42 @@ Without Docker: `nix run . ` or `cargo run --release`.
 /data/cookies.txt                              rotated session cookies (preferred while newer than the input)
 ```
 
+## Progress
+
+Each run logs to stderr (so to `docker logs` or your cron log) with UTC timestamps. It logs the starting
+state, a running total for each page of the library listing, `album i/N`, a line for each download with the
+rate and ETA, and a summary that is printed however the run ends:
+
+```
+2025-10-29 03:17:02Z state: 1234/5678 backed up (21.7%), 12 failing
+2025-10-29 03:17:02Z == indexing library
+2025-10-29 03:17:04Z indexed page 3: 1500 items seen this run, 2 new
+2025-10-29 03:18:10Z album 7/40 indexed: "Trip"
+2025-10-29 03:18:40Z == downloading
+2025-10-29 03:19:01Z [1235/5678 21.7%] saved media/2024/05/IMG_1.jpg (3.2 MB) - 41 items/h, ETA 3h12m this run
+2025-10-29 05:02:13Z == run summary: rate limited, resume later
+2025-10-29 05:02:13Z    this run: 71 downloaded (412.3 MB), 1 failed, elapsed 1h45m
+2025-10-29 05:02:13Z    library: 1305/5678 backed up (23.0%)
+```
+
+`gphotosync status` prints the state without contacting Google. It also works while a sync is running:
+
+```sh
+GPS_DATA=/srv/photos gphotosync status
+docker run --rm -v /srv/photos:/data gphotosync:latest status
+```
+```
+backed up: 1305/5678 (23.0%), 4373 pending
+albums:    40
+failing:   12 (retried next run)
+  AF1Qip... (3x): HTTP 403 Forbidden downloading https://...
+last run:  2025-10-29 03:17:02Z -> 2025-10-29 05:02:13Z: rate limited, resume later
+           71 downloaded (412.3 MB), 1 failed
+```
+
+On Unraid, either open the container's log from the Docker tab or run
+`docker run --rm -v /mnt/user/photos/gphotosync:/data gphotosync:latest status`.
+
 ## Resuming and exit codes
 
 All progress lives in `state.db`. Library paging checkpoints its page token, and each item is marked

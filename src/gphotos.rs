@@ -76,7 +76,7 @@ impl Jar {
                 .find(|(k, _)| k.eq_ignore_ascii_case("domain"))
                 .map_or(host, |(_, d)| d);
             // A host may only set cookies for itself or a parent domain (RFC 6265 5.3).
-            let d = domain.trim_start_matches('.');
+            let d = domain.trim_start_matches('.').to_ascii_lowercase();
             if host == d || host.ends_with(&format!(".{d}")) {
                 self.put(domain, n, v);
             }
@@ -141,7 +141,7 @@ impl Client {
         let prefix = &self.base["https://photos.google.com".len()..];
         self.rpc_path = if path.starts_with("/u/") { path.to_string() } else { format!("{prefix}{path}") };
         if let Some(email) = g["oPEP7c"].as_str() {
-            eprintln!("signed in as {email}");
+            log!("signed in as {email}");
         }
         Ok(())
     }
@@ -208,7 +208,7 @@ impl Client {
             let at = self.at.clone();
             let res = match self.fetch(&url, Some(&[("f.req", &freq), ("at", &at)])).await {
                 Ok(r) if matches!(r.status().as_u16(), 400 | 401 | 403) && attempt == 1 => {
-                    eprintln!("{rpcid}: {} - refreshing session tokens", r.status());
+                    log!("{rpcid}: {} - refreshing session tokens", r.status());
                     self.bootstrap().await?;
                     continue;
                 }
@@ -226,7 +226,7 @@ impl Client {
                 break;
             }
             let backoff = Duration::from_secs(2u64.pow(attempt));
-            eprintln!("{rpcid} attempt {attempt} failed: {last:#}; retrying in {backoff:?}");
+            log!("{rpcid} attempt {attempt} failed: {last:#}; retrying in {backoff:?}");
             tokio::time::sleep(backoff).await;
         }
         Err(last)
@@ -270,7 +270,7 @@ impl Client {
         // Metadata only, and fails for items not in your library (e.g. from shared albums): don't lose the download over it.
         let full = match self.rpc("fDcn4b", json!([key, 1, null, null, 1])).await {
             Err(e) if !e.is::<Fatal>() => {
-                eprintln!("{key}: no extended info ({e:#}), using fallback name");
+                log!("{key}: no extended info ({e:#}), using fallback name");
                 Value::Null
             }
             r => r?,

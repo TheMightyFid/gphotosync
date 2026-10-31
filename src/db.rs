@@ -1,6 +1,6 @@
 //! SQLite state: everything needed to resume after a kill or rate limit.
 use anyhow::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 pub struct Db(Connection);
@@ -28,6 +28,13 @@ impl Db {
              CREATE TABLE IF NOT EXISTS album_items(album TEXT NOT NULL, item TEXT NOT NULL, PRIMARY KEY(album, item));
              CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT NOT NULL);",
         )?;
+        Ok(Db(c))
+    }
+
+    /// For `status`: never writes, so it can't disturb a running sync.
+    pub fn open_ro(path: &Path) -> Result<Self> {
+        let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        c.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Db(c))
     }
 
@@ -119,6 +126,26 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Pending items that have failed at least once.
+    pub fn failing(&self) -> Result<i64> {
+        Ok(self.0.query_row("SELECT COUNT(*) FROM items WHERE path IS NULL AND attempts>0", [], |r| r.get(0))?)
+    }
+
+    pub fn album_count(&self) -> Result<i64> {
+        Ok(self.0.query_row("SELECT COUNT(*) FROM albums", [], |r| r.get(0))?)
+    }
+
+    /// (key, attempts, last_error) of failing items.
+    // ponytail: no failure timestamp column, so "recent" = most attempts, then newest photo.
+    pub fn recent_errors(&self, n: usize) -> Result<Vec<(String, i64, String)>> {
+        let mut st = self.0.prepare(
+            "SELECT key, attempts, last_error FROM items WHERE path IS NULL AND attempts>0
+             ORDER BY attempts DESC, ts_ms DESC LIMIT ?",
+        )?;
+        let rows = st.query_map([n as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?.unwrap_or_default())))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     pub fn counts(&self) -> Result<(i64, i64)> {
         Ok(self.0.query_row(
             "SELECT COUNT(*), COUNT(path) FROM items",
@@ -143,6 +170,8 @@ mod tests {
         db.mark_done("b", "x.jpg").unwrap();
         db.upsert_items(&[it("b")]).unwrap(); // re-sighting must not reset download state
         assert_eq!(db.counts().unwrap(), (2, 1));
+        assert_eq!(db.failing().unwrap(), 1);
+        assert_eq!(db.recent_errors(5).unwrap(), vec![("a".into(), 1, "boom".into())]);
         db.set("tok", Some("t1")).unwrap();
         assert_eq!(db.get("tok").unwrap().as_deref(), Some("t1"));
         db.set("tok", None).unwrap();
