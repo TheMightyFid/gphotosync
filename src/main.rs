@@ -26,7 +26,11 @@ fn env(k: &str, default: &str) -> String {
 
 #[tokio::main]
 async fn main() {
-    let res = if std::env::args().nth(1).as_deref() == Some("status") { status() } else { run().await };
+    let res = if std::env::args().nth(1).as_deref() == Some("status") {
+        status()
+    } else {
+        run().await
+    };
     match res {
         Ok(()) => {}
         Err(e) => {
@@ -54,7 +58,10 @@ async fn run() -> Result<()> {
     match lock.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
-            log!("another run holds {}, exiting", data.join(".lock").display());
+            log!(
+                "another run holds {}, exiting",
+                data.join(".lock").display()
+            );
             return Ok(());
         }
         Err(e) => return Err(e).context("locking .lock"),
@@ -63,19 +70,32 @@ async fn run() -> Result<()> {
     // Google rotates session cookies; we save the rotated jar and prefer it while it's newer than the input.
     let saved = data.join("cookies.txt");
     let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    let src = if mtime(&saved) > mtime(&cookies) { &saved } else { &cookies };
-    let jar = Jar::parse(&std::fs::read_to_string(src).with_context(|| format!("reading {}", src.display()))?);
+    let src = if mtime(&saved) > mtime(&cookies) {
+        &saved
+    } else {
+        &cookies
+    };
+    let jar = Jar::parse(
+        &std::fs::read_to_string(src).with_context(|| format!("reading {}", src.display()))?,
+    );
 
     let mut db = Db::open(&data.join("state.db"))?;
     // After a block, back off across runs: hammering again at the next cron tick escalates Google's response.
     if let Some(until) = db.get("blocked_until")?.and_then(|v| v.parse::<i64>().ok())
         && until > now_ms()
     {
-        log!("cooling down after a block until {}, skipping this run", stamp(until));
+        log!(
+            "cooling down after a block until {}, skipping this run",
+            stamp(until)
+        );
         return Ok(());
     }
     let (total, done) = db.counts()?;
-    log!("state: {done}/{total} backed up ({:.1}%), {} failing", pct(done, total), db.failing()?);
+    log!(
+        "state: {done}/{total} backed up ({:.1}%), {} failing",
+        pct(done, total),
+        db.failing()?
+    );
     db.set("run_start", Some(&now_ms().to_string()))?;
     db.set("run_end", None)?;
     db.set("run_outcome", Some("running"))?;
@@ -86,7 +106,8 @@ async fn run() -> Result<()> {
         Err(e) => Err(e),
         Ok(mut gp) => {
             // docker stop / cron timeout send SIGTERM: stop syncing but still save the rotated cookies below.
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             let res = tokio::select! {
                 r = sync(&mut gp, &mut db, &data, &mut st) => r,
                 _ = term.recv() => { signal = Some("terminated"); Err(anyhow::anyhow!("terminated, will resume next run")) }
@@ -96,14 +117,37 @@ async fn run() -> Result<()> {
             res.and(saved_jar)
         }
     };
-    // Escalating cooldown: 1h, 4h, 24h, then 72h for repeat blocks; cleared by a run that isn't blocked.
-    let blocked = res.as_ref().err().and_then(|e| e.downcast_ref::<Fatal>()).is_some_and(|f| matches!(f, Fatal::Blocked(_)));
-    let strikes = if blocked { db.get("block_strikes")?.and_then(|v| v.parse().ok()).unwrap_or(0) + 1 } else { 0 };
+    // Escalating cooldown: 1h, 4h, 24h, then 72h for repeat blocks. Only a clean run resets the strikes:
+    // a sign-out, network error or SIGTERM proves nothing about whether Google still has us flagged.
+    let blocked = res
+        .as_ref()
+        .err()
+        .and_then(|e| e.downcast_ref::<Fatal>())
+        .is_some_and(|f| matches!(f, Fatal::Blocked(_)));
+    let prev: usize = db
+        .get("block_strikes")?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let strikes = if blocked {
+        prev + 1
+    } else if res.is_ok() {
+        0
+    } else {
+        prev
+    };
     db.set("block_strikes", Some(&strikes.to_string()))?;
     let hours = [0, 1, 4, 24, 72][strikes.min(4)];
-    db.set("blocked_until", blocked.then(|| (now_ms() + hours * 3_600_000).to_string()).as_deref())?;
+    db.set(
+        "blocked_until",
+        blocked
+            .then(|| (now_ms() + hours * 3_600_000).to_string())
+            .as_deref(),
+    )?;
     if blocked {
-        log!("blocked (strike {strikes}): next run allowed after {}", stamp(now_ms() + hours * 3_600_000));
+        log!(
+            "blocked (strike {strikes}): next run allowed after {}",
+            stamp(now_ms() + hours * 3_600_000)
+        );
     }
     let outcome = match &res {
         Ok(()) => "finished".to_string(),
@@ -117,8 +161,16 @@ async fn run() -> Result<()> {
     let (total, done) = db.counts()?;
     let elapsed = fmt_dur(t0.elapsed().as_secs());
     log!("== run summary: {outcome}");
-    log!("   this run: {} downloaded ({}), {} failed, elapsed {elapsed}", st.items, fmt_bytes(st.bytes), st.failed);
-    log!("   library: {done}/{total} backed up ({:.1}%)", pct(done, total));
+    log!(
+        "   this run: {} downloaded ({}), {} failed, elapsed {elapsed}",
+        st.items,
+        fmt_bytes(st.bytes),
+        st.failed
+    );
+    log!(
+        "   library: {done}/{total} backed up ({:.1}%)",
+        pct(done, total)
+    );
     for (k, v) in [
         ("run_end", now_ms().to_string()),
         ("run_outcome", outcome),
@@ -135,7 +187,13 @@ async fn run() -> Result<()> {
 /// 0600: these cookies are full access to the Google account.
 fn save_jar(gp: &Client, saved: &Path) -> Result<()> {
     let tmp = saved.with_extension("txt.tmp");
-    std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?.write_all(gp.jar.dump().as_bytes())?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?
+        .write_all(gp.jar.dump().as_bytes())?;
     std::fs::rename(&tmp, saved)?;
     Ok(())
 }
@@ -230,10 +288,16 @@ async fn download(gp: &mut Client, db: &mut Db, data: &Path, st: &mut Stats) -> 
     let mut tried = HashSet::new();
     let mut consecutive_failures = 0;
     // Spread a big first sync over several runs instead of one 30h burst (docs/bot-risk.md). 0 = unlimited.
-    let max_items: u64 = env("GPS_MAX_ITEMS", "2000").parse().context("GPS_MAX_ITEMS")?;
+    let max_items: u64 = env("GPS_MAX_ITEMS", "2000")
+        .parse()
+        .context("GPS_MAX_ITEMS")?;
     let mut next_pause = gphotos::jitter(50.0, 200.0) as u64;
     loop {
-        let batch: Vec<_> = db.pending(200 + tried.len())?.into_iter().filter(|i| !tried.contains(&i.key)).collect();
+        let batch: Vec<_> = db
+            .pending(200 + tried.len())?
+            .into_iter()
+            .filter(|i| !tried.contains(&i.key))
+            .collect();
         if batch.is_empty() {
             return Ok(());
         }
@@ -253,7 +317,11 @@ async fn download(gp: &mut Client, db: &mut Db, data: &Path, st: &mut Stats) -> 
                     consecutive_failures = 0;
                     db.mark_done(&item.key, &path)?;
                     (done, st.items, st.bytes) = (done + 1, st.items + 1, st.bytes + size);
-                    let (rate, eta) = rate_eta(st.items, (total - done).max(0) as u64, t0.elapsed().as_secs());
+                    let (rate, eta) = rate_eta(
+                        st.items,
+                        (total - done).max(0) as u64,
+                        t0.elapsed().as_secs(),
+                    );
                     log!(
                         "[{done}/{total} {:.1}%] saved {path} ({}) - {rate} items/h, ETA {eta} this run",
                         pct(done, total),
@@ -282,9 +350,17 @@ async fn download(gp: &mut Client, db: &mut Db, data: &Path, st: &mut Stats) -> 
 async fn download_one(gp: &mut Client, item: &db::Item, data: &Path) -> Result<(String, u64)> {
     let (url, live, full) = gp.item_urls(&item.key).await?;
     let d = &full[0];
-    let name = d[2].as_str().map(sanitize).filter(|s| !s.is_empty()).unwrap_or_else(|| {
-        format!("{}.{}", sanitize(&item.key), if item.is_video { "mp4" } else { "jpg" })
-    });
+    let name = d[2]
+        .as_str()
+        .map(sanitize)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}.{}",
+                sanitize(&item.key),
+                if item.is_video { "mp4" } else { "jpg" }
+            )
+        });
     let (y, m) = year_month(item.ts_ms);
     let dir = format!("media/{y:04}/{m:02}");
     std::fs::create_dir_all(data.join(&dir))?;
@@ -295,7 +371,10 @@ async fn download_one(gp: &mut Client, item: &db::Item, data: &Path) -> Result<(
         sidecar["live_video"] = json!(format!("{stem}.live.mov"));
     }
     // Sidecar first: it claims `rel` for this key, so a run killed mid-download reuses the same name.
-    std::fs::write(data.join(format!("{rel}.json")), serde_json::to_vec_pretty(&sidecar)?)?;
+    std::fs::write(
+        data.join(format!("{rel}.json")),
+        serde_json::to_vec_pretty(&sidecar)?,
+    )?;
     let mut size = fetch_to(gp, &url, &data.join(&rel)).await?;
     if let Some(expect) = d[5].as_u64()
         && expect != size
@@ -320,10 +399,23 @@ async fn fetch_to(gp: &mut Client, url: &str, path: &Path) -> Result<u64> {
         bail!("HTTP {} downloading {url}", resp.status());
     }
     // An expired URL or interstitial can come back as a 200 HTML page (even via photos.google.com).
-    if resp.headers().get(reqwest::header::CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"text/html")) {
+    if resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"text/html"))
+    {
         let url = resp.url().to_string();
-        if gphotos::is_captcha(&resp.text().await.unwrap_or_default()) {
-            Err(Fatal::Blocked(format!("captcha instead of media from {url}")))?
+        // Only sniff the start: a mislabelled multi-GB video must not be buffered in memory.
+        let (mut head, mut body) = (Vec::new(), resp.bytes_stream());
+        while head.len() < 1 << 20
+            && let Some(Ok(chunk)) = body.next().await
+        {
+            head.extend_from_slice(&chunk);
+        }
+        if gphotos::is_captcha(&String::from_utf8_lossy(&head)) {
+            Err(Fatal::Blocked(format!(
+                "captcha instead of media from {url}"
+            )))?
         }
         bail!("got HTML instead of media from {url}");
     }
@@ -348,13 +440,27 @@ fn link_albums(db: &Db, data: &Path) -> Result<()> {
         std::fs::remove_dir_all(&albums)?;
     }
     for (key, title, path) in db.album_links()? {
-        let dir = albums.join(format!("{} [{}]", sanitize(&title), &key[key.len().saturating_sub(6)..]));
+        let dir = albums.join(format!(
+            "{} [{}]",
+            sanitize(&title),
+            &key[key.len().saturating_sub(6)..]
+        ));
         std::fs::create_dir_all(&dir)?;
-        let file = Path::new(&path).file_name().context("bad path")?.to_string_lossy();
+        let file = Path::new(&path)
+            .file_name()
+            .context("bad path")?
+            .to_string_lossy();
         let mut link = dir.join(&*file);
         if link.symlink_metadata().is_ok() {
             // Same filename from different months: disambiguate with the month dir.
-            link = dir.join(format!("{}_{file}", path.split('/').skip(1).take(2).collect::<Vec<_>>().join("-")));
+            link = dir.join(format!(
+                "{}_{file}",
+                path.split('/')
+                    .skip(1)
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join("-")
+            ));
         }
         if link.symlink_metadata().is_err() {
             std::os::unix::fs::symlink(Path::new("../..").join(&path), &link)?;
@@ -365,24 +471,42 @@ fn link_albums(db: &Db, data: &Path) -> Result<()> {
 
 /// Safe single path component, capped well under the 255-byte filename limit (room for suffixes and `.json`).
 fn sanitize(s: &str) -> String {
-    let s: String = s.chars().map(|c| if c == '/' || c == '\0' || c.is_control() { '_' } else { c }).collect();
+    let s: String = s
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\0' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
     let s = s.trim().trim_start_matches('.');
     if s.len() <= 180 {
         return s.to_string();
     }
     // Keep the extension when truncating.
-    let (stem, ext) = s.rsplit_once('.').filter(|(_, e)| e.len() <= 10).unwrap_or((s, ""));
+    let (stem, ext) = s
+        .rsplit_once('.')
+        .filter(|(_, e)| e.len() <= 10)
+        .unwrap_or((s, ""));
     let mut end = 180 - ext.len() - 1;
     while !stem.is_char_boundary(end) {
         end -= 1;
     }
-    if ext.is_empty() { stem[..end].to_string() } else { format!("{}.{ext}", &stem[..end]) }
+    if ext.is_empty() {
+        stem[..end].to_string()
+    } else {
+        format!("{}.{ext}", &stem[..end])
+    }
 }
 
 /// `name` in dir unless another item already claimed it (via its sidecar); then insert the key tail.
 fn unique(data: &Path, dir: &str, name: &str, key: &str) -> String {
     let rel = format!("{dir}/{name}");
-    let claimed_by = std::fs::read_to_string(data.join(format!("{rel}.json"))).ok().map(|s| raw(&s)["media_key"].clone());
+    let claimed_by = std::fs::read_to_string(data.join(format!("{rel}.json")))
+        .ok()
+        .map(|s| raw(&s)["media_key"].clone());
     if claimed_by.is_none_or(|k| k == key) {
         return rel;
     }
@@ -412,18 +536,29 @@ fn civil(ms: i64) -> (i64, u32, u32) {
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 /// `2025-10-29 15:50:48Z`
 fn stamp(ms: i64) -> String {
     let (y, mo, d) = civil(ms);
     let s = ms.div_euclid(1000).rem_euclid(86_400);
-    format!("{y:04}-{mo:02}-{d:02} {:02}:{:02}:{:02}Z", s / 3600, s / 60 % 60, s % 60)
+    format!(
+        "{y:04}-{mo:02}-{d:02} {:02}:{:02}:{:02}Z",
+        s / 3600,
+        s / 60 % 60,
+        s % 60
+    )
 }
 
 fn pct(done: i64, total: i64) -> f64 {
-    if total == 0 { 100.0 } else { done as f64 * 100.0 / total as f64 }
+    if total == 0 {
+        100.0
+    } else {
+        done as f64 * 100.0 / total as f64
+    }
 }
 
 fn fmt_bytes(b: u64) -> String {
@@ -462,7 +597,11 @@ fn status() -> Result<()> {
     }
     let db = Db::open_ro(&path)?;
     let (total, done) = db.counts()?;
-    println!("backed up: {done}/{total} ({:.1}%), {} pending", pct(done, total), total - done);
+    println!(
+        "backed up: {done}/{total} ({:.1}%), {} pending",
+        pct(done, total),
+        total - done
+    );
     println!("albums:    {}", db.album_count()?);
     let failing = db.failing()?;
     println!("failing:   {failing} (retried next run)");
@@ -473,17 +612,32 @@ fn status() -> Result<()> {
     let when = |k| kv(k).map(|v| v.parse().map_or("-".into(), stamp));
     match kv("run_outcome")?.as_str() {
         "" => println!("last run:  none recorded"),
-        "running" => println!("last run:  started {}, still running (or was killed)", when("run_start")?),
+        "running" => println!(
+            "last run:  started {}, still running (or was killed)",
+            when("run_start")?
+        ),
         outcome => {
-            println!("last run:  {} -> {}: {outcome}", when("run_start")?, when("run_end")?);
+            println!(
+                "last run:  {} -> {}: {outcome}",
+                when("run_start")?,
+                when("run_end")?
+            );
             let bytes = kv("run_bytes")?.parse().unwrap_or(0);
-            println!("           {} downloaded ({}), {} failed", kv("run_items")?, fmt_bytes(bytes), kv("run_failed")?);
+            println!(
+                "           {} downloaded ({}), {} failed",
+                kv("run_items")?,
+                fmt_bytes(bytes),
+                kv("run_failed")?
+            );
         }
     }
     if let Ok(until) = kv("blocked_until")?.parse::<i64>()
         && until > now_ms()
     {
-        println!("cooldown:  blocked by Google, next run allowed after {}", stamp(until));
+        println!(
+            "cooldown:  blocked by Google, next run allowed after {}",
+            stamp(until)
+        );
     }
     Ok(())
 }
@@ -507,7 +661,10 @@ mod tests {
         assert_eq!(unique(&t, "d", "x.jpg", "AF1Qip12345678"), "d/x.jpg");
         std::fs::write(t.join("d/x.jpg.json"), r#"{"media_key":"AF1Qip12345678"}"#).unwrap();
         assert_eq!(unique(&t, "d", "x.jpg", "AF1Qip12345678"), "d/x.jpg"); // own claim: resume in place
-        assert_eq!(unique(&t, "d", "x.jpg", "AF1QipOTHERKEY"), "d/x_OTHERKEY.jpg");
+        assert_eq!(
+            unique(&t, "d", "x.jpg", "AF1QipOTHERKEY"),
+            "d/x_OTHERKEY.jpg"
+        );
         std::fs::remove_dir_all(t).unwrap();
     }
 

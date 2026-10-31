@@ -1,6 +1,6 @@
 //! SQLite state: everything needed to resume after a kill or rate limit.
 use anyhow::Result;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::path::Path;
 
 pub struct Db(Connection);
@@ -39,12 +39,17 @@ impl Db {
     }
 
     pub fn get(&self, k: &str) -> Result<Option<String>> {
-        Ok(self.0.query_row("SELECT v FROM kv WHERE k=?", [k], |r| r.get(0)).optional()?)
+        Ok(self
+            .0
+            .query_row("SELECT v FROM kv WHERE k=?", [k], |r| r.get(0))
+            .optional()?)
     }
 
     pub fn set(&self, k: &str, v: Option<&str>) -> Result<()> {
         match v {
-            Some(v) => self.0.execute("INSERT OR REPLACE INTO kv VALUES(?,?)", [k, v])?,
+            Some(v) => self
+                .0
+                .execute("INSERT OR REPLACE INTO kv VALUES(?,?)", [k, v])?,
             None => self.0.execute("DELETE FROM kv WHERE k=?", [k])?,
         };
         Ok(())
@@ -101,18 +106,29 @@ impl Db {
              ORDER BY attempts, ts_ms DESC LIMIT ?",
         )?;
         let rows = st.query_map([limit as i64], |r| {
-            Ok(Item { key: r.get(0)?, ts_ms: r.get(1)?, is_video: r.get(2)?, meta: r.get(3)? })
+            Ok(Item {
+                key: r.get(0)?,
+                ts_ms: r.get(1)?,
+                is_video: r.get(2)?,
+                meta: r.get(3)?,
+            })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn mark_done(&self, key: &str, path: &str) -> Result<()> {
-        self.0.execute("UPDATE items SET path=?, last_error=NULL WHERE key=?", [path, key])?;
+        self.0.execute(
+            "UPDATE items SET path=?, last_error=NULL WHERE key=?",
+            [path, key],
+        )?;
         Ok(())
     }
 
     pub fn mark_failed(&self, key: &str, err: &str) -> Result<()> {
-        self.0.execute("UPDATE items SET attempts=attempts+1, last_error=? WHERE key=?", [err, key])?;
+        self.0.execute(
+            "UPDATE items SET attempts=attempts+1, last_error=? WHERE key=?",
+            [err, key],
+        )?;
         Ok(())
     }
 
@@ -128,11 +144,17 @@ impl Db {
 
     /// Pending items that have failed at least once.
     pub fn failing(&self) -> Result<i64> {
-        Ok(self.0.query_row("SELECT COUNT(*) FROM items WHERE path IS NULL AND attempts>0", [], |r| r.get(0))?)
+        Ok(self.0.query_row(
+            "SELECT COUNT(*) FROM items WHERE path IS NULL AND attempts>0",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn album_count(&self) -> Result<i64> {
-        Ok(self.0.query_row("SELECT COUNT(*) FROM albums", [], |r| r.get(0))?)
+        Ok(self
+            .0
+            .query_row("SELECT COUNT(*) FROM albums", [], |r| r.get(0))?)
     }
 
     /// (key, attempts, last_error) of failing items.
@@ -142,16 +164,22 @@ impl Db {
             "SELECT key, attempts, last_error FROM items WHERE path IS NULL AND attempts>0
              ORDER BY attempts DESC, ts_ms DESC LIMIT ?",
         )?;
-        let rows = st.query_map([n as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?.unwrap_or_default())))?;
+        let rows = st.query_map([n as i64], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn counts(&self) -> Result<(i64, i64)> {
-        Ok(self.0.query_row(
-            "SELECT COUNT(*), COUNT(path) FROM items",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?)
+        Ok(self
+            .0
+            .query_row("SELECT COUNT(*), COUNT(path) FROM items", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?)
     }
 }
 
@@ -162,7 +190,12 @@ mod tests {
     #[test]
     fn resume_state() {
         let mut db = Db::open(Path::new(":memory:")).unwrap();
-        let it = |k: &str| Item { key: k.into(), ts_ms: 1, is_video: false, meta: "{}".into() };
+        let it = |k: &str| Item {
+            key: k.into(),
+            ts_ms: 1,
+            is_video: false,
+            meta: "{}".into(),
+        };
         assert_eq!(db.upsert_items(&[it("a"), it("b")]).unwrap(), 2);
         assert_eq!(db.upsert_items(&[it("a")]).unwrap(), 0);
         db.mark_failed("a", "boom").unwrap();
@@ -171,13 +204,19 @@ mod tests {
         db.upsert_items(&[it("b")]).unwrap(); // re-sighting must not reset download state
         assert_eq!(db.counts().unwrap(), (2, 1));
         assert_eq!(db.failing().unwrap(), 1);
-        assert_eq!(db.recent_errors(5).unwrap(), vec![("a".into(), 1, "boom".into())]);
+        assert_eq!(
+            db.recent_errors(5).unwrap(),
+            vec![("a".into(), 1, "boom".into())]
+        );
         db.set("tok", Some("t1")).unwrap();
         assert_eq!(db.get("tok").unwrap().as_deref(), Some("t1"));
         db.set("tok", None).unwrap();
         assert_eq!(db.get("tok").unwrap(), None);
         db.upsert_album("al", "Trip", "{}").unwrap();
         db.add_album_items("al", &[it("b")]).unwrap();
-        assert_eq!(db.album_links().unwrap(), vec![("al".into(), "Trip".into(), "x.jpg".into())]);
+        assert_eq!(
+            db.album_links().unwrap(),
+            vec![("al".into(), "Trip".into(), "x.jpg".into())]
+        );
     }
 }

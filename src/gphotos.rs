@@ -19,7 +19,9 @@ pub fn jitter(lo: f64, hi: f64) -> f64 {
 
 /// Captcha / "unusual traffic" interstitial markers.
 pub fn is_captcha(body: &str) -> bool {
-    body.contains("unusual traffic") || body.contains("g-recaptcha") || body.contains("/sorry/index")
+    body.contains("unusual traffic")
+        || body.contains("g-recaptcha")
+        || body.contains("/sorry/index")
 }
 
 /// Conditions where continuing is pointless; the run stops and state is kept for next time.
@@ -57,7 +59,10 @@ impl Jar {
     }
 
     pub fn dump(&self) -> String {
-        self.0.iter().map(|(d, n, v)| format!(".{d}\tTRUE\t/\tTRUE\t0\t{n}\t{v}\n")).collect()
+        self.0
+            .iter()
+            .map(|(d, n, v)| format!(".{d}\tTRUE\t/\tTRUE\t0\t{n}\t{v}\n"))
+            .collect()
     }
 
     fn put(&mut self, domain: &str, name: &str, value: &str) {
@@ -83,7 +88,9 @@ impl Jar {
         for h in resp.headers().get_all(SET_COOKIE) {
             let Ok(s) = h.to_str() else { continue };
             let mut parts = s.split(';');
-            let Some((n, v)) = parts.next().and_then(|p| p.trim().split_once('=')) else { continue };
+            let Some((n, v)) = parts.next().and_then(|p| p.trim().split_once('=')) else {
+                continue;
+            };
             let domain = parts
                 .filter_map(|p| p.trim().split_once('='))
                 .find(|(k, _)| k.eq_ignore_ascii_case("domain"))
@@ -136,8 +143,14 @@ impl Client {
     async fn bootstrap(&mut self) -> Result<()> {
         let resp = self.fetch(&format!("{}/", self.base), None).await?;
         // Google redirects /u/N/ elsewhere when account N isn't in the cookies; don't back up the wrong account.
-        if !self.base.ends_with("/u/0") && !resp.url().as_str().starts_with(&format!("{}/", self.base)) {
-            Err(Fatal::SignedOut(format!("{} redirected to {}: account not in cookies", self.base, resp.url())))?
+        if !self.base.ends_with("/u/0")
+            && !resp.url().as_str().starts_with(&format!("{}/", self.base))
+        {
+            Err(Fatal::SignedOut(format!(
+                "{} redirected to {}: account not in cookies",
+                self.base,
+                resp.url()
+            )))?
         }
         let html = resp.text().await?;
         if is_captcha(&html) {
@@ -145,14 +158,26 @@ impl Client {
         }
         let g = wiz_global_data(&html)
             .ok_or_else(|| Fatal::SignedOut("no WIZ_global_data on photos.google.com".into()))?;
-        let s = |k: &str| g[k].as_str().map(String::from).ok_or_else(|| anyhow!("WIZ_global_data missing {k}"));
-        self.at = s("SNlM0e").map_err(|_| Fatal::SignedOut("no SNlM0e token (not logged in?)".into()))?;
+        let s = |k: &str| {
+            g[k].as_str()
+                .map(String::from)
+                .ok_or_else(|| anyhow!("WIZ_global_data missing {k}"))
+        };
+        self.at =
+            s("SNlM0e").map_err(|_| Fatal::SignedOut("no SNlM0e token (not logged in?)".into()))?;
         self.fsid = s("FdrFJe")?;
         self.bl = s("cfb2h")?;
         // RPCs must carry /u/N or they hit account 0; eptZe may or may not include it (spec 1.2, uncertain).
-        let path = g["eptZe"].as_str().unwrap_or("/_/PhotosUi").trim_end_matches('/');
+        let path = g["eptZe"]
+            .as_str()
+            .unwrap_or("/_/PhotosUi")
+            .trim_end_matches('/');
         let prefix = &self.base["https://photos.google.com".len()..];
-        self.rpc_path = if path.starts_with("/u/") { path.to_string() } else { format!("{prefix}{path}") };
+        self.rpc_path = if path.starts_with("/u/") {
+            path.to_string()
+        } else {
+            format!("{prefix}{path}")
+        };
         if let Some(email) = g["oPEP7c"].as_str() {
             log!("signed in as {email}");
         }
@@ -166,7 +191,7 @@ impl Client {
         let mut form = form;
         for _ in 0..10 {
             let host = url.host_str().unwrap_or_default().to_string();
-            // Roughly what Chrome sends: XHR-style for RPCs, plain navigation-less GET for media (no Origin).
+            // Roughly what Chrome sends: XHR-style for RPCs, GETs look like navigations/downloads (no Origin).
             let rb = match form {
                 Some(f) => self
                     .http
@@ -176,7 +201,11 @@ impl Client {
                     .header("origin", "https://photos.google.com")
                     .header("sec-fetch-mode", "cors")
                     .header("sec-fetch-dest", "empty"),
-                None => self.http.get(url.clone()).header("sec-fetch-mode", "no-cors").header("sec-fetch-dest", "empty"),
+                None => self
+                    .http
+                    .get(url.clone())
+                    .header("sec-fetch-mode", "navigate")
+                    .header("sec-fetch-dest", "document"),
             };
             let resp = rb
                 .header(COOKIE, self.jar.header(&host))
@@ -184,7 +213,14 @@ impl Client {
                 .header("accept", "*/*")
                 .header("accept-language", "en-US,en;q=0.9")
                 .header("referer", "https://photos.google.com/")
-                .header("sec-fetch-site", if host == "photos.google.com" { "same-origin" } else { "cross-site" })
+                .header(
+                    "sec-fetch-site",
+                    match host.as_str() {
+                        "photos.google.com" => "same-origin",
+                        h if h.ends_with(".google.com") => "same-site",
+                        _ => "cross-site",
+                    },
+                )
                 .send()
                 .await?;
             self.jar.absorb(&resp, &host);
@@ -195,7 +231,11 @@ impl Client {
             if !st.is_redirection() {
                 return Ok(resp);
             }
-            let loc = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).unwrap_or_default();
+            let loc = resp
+                .headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
             url = url.join(loc)?;
             if url.scheme() != "https" {
                 bail!("refusing non-https redirect to {url}"); // would leak cookies in cleartext
@@ -204,7 +244,10 @@ impl Client {
             if u.contains("google.com/sorry") {
                 Err(Fatal::Blocked(u.into()))?
             }
-            if u.contains("accounts.google.com") || u.contains("/photos/about") || u.contains("consent.google.com") {
+            if u.contains("accounts.google.com")
+                || u.contains("/photos/about")
+                || u.contains("consent.google.com")
+            {
                 Err(Fatal::SignedOut(u.into()))?
             }
             form = None; // 30x after POST becomes GET, like a browser
@@ -218,7 +261,11 @@ impl Client {
         let mut last = anyhow!("unreachable");
         for attempt in 1..=4u32 {
             // Jittered gap: perfectly periodic requests are the easiest bot signal to spot.
-            if let Some(wait) = self.delay.mul_f64(jitter(0.6, 1.8)).checked_sub(self.last_rpc.elapsed()) {
+            if let Some(wait) = self
+                .delay
+                .mul_f64(jitter(0.6, 1.8))
+                .checked_sub(self.last_rpc.elapsed())
+            {
                 tokio::time::sleep(wait).await;
             }
             self.last_rpc = Instant::now();
@@ -230,7 +277,10 @@ impl Client {
                 self.bl
             );
             let at = self.at.clone();
-            let res = match self.fetch(&url, Some(&[("f.req", &freq), ("at", &at)])).await {
+            let res = match self
+                .fetch(&url, Some(&[("f.req", &freq), ("at", &at)]))
+                .await
+            {
                 Ok(r) if matches!(r.status().as_u16(), 400 | 401 | 403) && attempt == 1 => {
                     log!("{rpcid}: {} - refreshing session tokens", r.status());
                     self.bootstrap().await?;
@@ -257,34 +307,61 @@ impl Client {
     }
 
     /// One page of the whole library (library + archive), newest first.
-    pub async fn library_page(&mut self, token: Option<&str>) -> Result<(Vec<Item>, Option<String>)> {
-        let d = self.rpc("lcxiM", json!([token, null, 500, null, 1, 3])).await?;
+    pub async fn library_page(
+        &mut self,
+        token: Option<&str>,
+    ) -> Result<(Vec<Item>, Option<String>)> {
+        let d = self
+            .rpc("lcxiM", json!([token, null, 500, null, 1, 3]))
+            .await?;
         Ok((items(&d[0]), next(&d[1])))
     }
 
     /// One page of albums: (key, title, authKey, raw record).
-    pub async fn albums_page(&mut self, token: Option<&str>) -> Result<(Vec<(String, String, Option<String>, Value)>, Option<String>)> {
-        let d = self.rpc("Z5xsfc", json!([token, null, null, null, 1, null, null, 100, [2], 5])).await?;
+    pub async fn albums_page(
+        &mut self,
+        token: Option<&str>,
+    ) -> Result<(Vec<(String, String, Option<String>, Value)>, Option<String>)> {
+        let d = self
+            .rpc(
+                "Z5xsfc",
+                json!([token, null, null, null, 1, null, null, 100, [2], 5]),
+            )
+            .await?;
         let albums = d[0]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|a| {
                 let e = &ext(a)?["72930366"];
-                Some((a[0].as_str()?.into(), e[1].as_str().unwrap_or("untitled").into(), e[5].as_str().map(String::from), a.clone()))
+                Some((
+                    a[0].as_str()?.into(),
+                    e[1].as_str().unwrap_or("untitled").into(),
+                    e[5].as_str().map(String::from),
+                    a.clone(),
+                ))
             })
             .collect();
         Ok((albums, next(&d[1])))
     }
 
-    pub async fn album_page(&mut self, album: &str, auth: Option<&str>, token: Option<&str>) -> Result<(Vec<Item>, Option<String>)> {
-        let d = self.rpc("snAcKc", json!([album, token, null, auth])).await?;
+    pub async fn album_page(
+        &mut self,
+        album: &str,
+        auth: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<(Vec<Item>, Option<String>)> {
+        let d = self
+            .rpc("snAcKc", json!([album, token, null, auth]))
+            .await?;
         Ok((items(&d[1]), next(&d[2])))
     }
 
     /// (original download URL, live-photo video URL, extended info record).
     pub async fn item_urls(&mut self, key: &str) -> Result<(String, Option<String>, Value)> {
-        let info = self.rpc("VrseUb", json!([key, null, null, null, null])).await?;
+        let info = self
+            .rpc("VrseUb", json!([key, null, null, null, null]))
+            .await?;
         let url = [&info[7], &info[1]]
             .into_iter()
             .find_map(|v| v.as_str().filter(|s| s.starts_with("https://")))
@@ -322,7 +399,11 @@ pub fn parse_item(rec: &Value) -> Option<Item> {
 }
 
 fn items(v: &Value) -> Vec<Item> {
-    v.as_array().into_iter().flatten().filter_map(parse_item).collect()
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(parse_item)
+        .collect()
 }
 
 pub fn wiz_global_data(html: &str) -> Option<Value> {
@@ -342,7 +423,9 @@ pub fn parse_batch(body: &str, rpcid: &str) -> Result<Value> {
         let v: Value = serde_json::from_str(line).context("bad batchexecute chunk")?;
         for env in v.as_array().into_iter().flatten() {
             if env[0] == "wrb.fr" && env[1] == rpcid {
-                let s = env[2].as_str().ok_or_else(|| anyhow!("{rpcid}: empty result (error {})", env[5]))?;
+                let s = env[2]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("{rpcid}: empty result (error {})", env[5]))?;
                 return Ok(serde_json::from_str(s)?);
             }
         }
@@ -359,7 +442,10 @@ mod tests {
         let body = ")]}'\n\n120\n[[\"wrb.fr\",\"lcxiM\",\"[[[\\\"AF1Q\\\",[\\\"https://x/y\\\",10,20],1761753048000,\\\"d\\\",3600000,1,{\\\"76647426\\\":[1]}]],\\\"tok\\\"]\",null,null,null,\"generic\"]]\n25\n[[\"e\",4,null,null,1290]]\n";
         let d = parse_batch(body, "lcxiM").unwrap();
         let it = items(&d[0]);
-        assert_eq!((it[0].key.as_str(), it[0].ts_ms, it[0].is_video), ("AF1Q", 1761753048000, true));
+        assert_eq!(
+            (it[0].key.as_str(), it[0].ts_ms, it[0].is_video),
+            ("AF1Q", 1761753048000, true)
+        );
         assert_eq!(next(&d[1]).as_deref(), Some("tok"));
         assert!(parse_batch(body, "Z5xsfc").is_err());
         let err = ")]}'\n\n50\n[[\"wrb.fr\",\"lcxiM\",null,null,null,[3],\"generic\"]]\n";
@@ -370,9 +456,14 @@ mod tests {
     fn wiz_and_jar() {
         let html = r#"<script data-id="_gd">window.WIZ_global_data = {"SNlM0e":"tok","FdrFJe":"-12"};</script>"#;
         assert_eq!(wiz_global_data(html).unwrap()["FdrFJe"], "-12");
-        let j = Jar::parse("# c\n.google.com\tTRUE\t/\tTRUE\t0\tSID\tabc\n#HttpOnly_photos.google.com\tFALSE\t/\tTRUE\t0\tX\ty\n");
+        let j = Jar::parse(
+            "# c\n.google.com\tTRUE\t/\tTRUE\t0\tSID\tabc\n#HttpOnly_photos.google.com\tFALSE\t/\tTRUE\t0\tX\ty\n",
+        );
         assert_eq!(j.header("photos.google.com"), "SID=abc; X=y");
         assert_eq!(j.header("lh3.googleusercontent.com"), "");
-        assert_eq!(Jar::parse(&j.dump()).header("photos.google.com"), "SID=abc; X=y");
+        assert_eq!(
+            Jar::parse(&j.dump()).header("photos.google.com"),
+            "SID=abc; X=y"
+        );
     }
 }
