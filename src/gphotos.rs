@@ -2,7 +2,7 @@
 //! See docs/rpc-spec.md for where every index below comes from.
 use crate::db::Item;
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::header::{CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE, USER_AGENT};
+use reqwest::header::{COOKIE, LOCATION, SET_COOKIE, USER_AGENT};
 use reqwest::{Response, StatusCode, Url};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -84,6 +84,7 @@ pub struct Client {
     http: reqwest::Client,
     pub jar: Jar,
     base: String,
+    rpc_path: String,
     at: String,
     fsid: String,
     bl: String,
@@ -95,13 +96,15 @@ impl Client {
     pub async fn new(jar: Jar, account: u32, delay: Duration) -> Result<Client> {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(600))
+            // Per-read, not total: a multi-GB video can legitimately take longer than any fixed total.
+            .read_timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(30))
             .build()?;
         let mut c = Client {
             http,
             jar,
             base: format!("https://photos.google.com/u/{account}"),
+            rpc_path: String::new(),
             at: String::new(),
             fsid: String::new(),
             bl: String::new(),
@@ -114,13 +117,25 @@ impl Client {
 
     /// Scrape the per-session tokens out of WIZ_global_data on the main page.
     async fn bootstrap(&mut self) -> Result<()> {
-        let html = self.fetch(&format!("{}/", self.base), None).await?.text().await?;
+        let resp = self.fetch(&format!("{}/", self.base), None).await?;
+        // Google redirects /u/N/ elsewhere when account N isn't in the cookies; don't back up the wrong account.
+        if !self.base.ends_with("/u/0") && !resp.url().as_str().starts_with(&format!("{}/", self.base)) {
+            Err(Fatal::SignedOut(format!("{} redirected to {}: account not in cookies", self.base, resp.url())))?
+        }
+        let html = resp.text().await?;
+        if html.contains("unusual traffic") || html.contains("g-recaptcha") {
+            Err(Fatal::Blocked("captcha page on photos.google.com".into()))?
+        }
         let g = wiz_global_data(&html)
             .ok_or_else(|| Fatal::SignedOut("no WIZ_global_data on photos.google.com".into()))?;
         let s = |k: &str| g[k].as_str().map(String::from).ok_or_else(|| anyhow!("WIZ_global_data missing {k}"));
         self.at = s("SNlM0e").map_err(|_| Fatal::SignedOut("no SNlM0e token (not logged in?)".into()))?;
         self.fsid = s("FdrFJe")?;
         self.bl = s("cfb2h")?;
+        // RPCs must carry /u/N or they hit account 0; eptZe may or may not include it (spec 1.2, uncertain).
+        let path = g["eptZe"].as_str().unwrap_or("/_/PhotosUi").trim_end_matches('/');
+        let prefix = &self.base["https://photos.google.com".len()..];
+        self.rpc_path = if path.starts_with("/u/") { path.to_string() } else { format!("{prefix}{path}") };
         if let Some(email) = g["oPEP7c"].as_str() {
             eprintln!("signed in as {email}");
         }
@@ -151,9 +166,6 @@ impl Client {
                 Err(Fatal::Blocked(format!("429 from {host}")))?
             }
             if !st.is_redirection() {
-                if resp.headers().get(CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"text/html")) && form.is_none() && !host.starts_with("photos.") {
-                    bail!("got HTML instead of media from {host}");
-                }
                 return Ok(resp);
             }
             let loc = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).unwrap_or_default();
@@ -180,8 +192,11 @@ impl Client {
             }
             self.last_rpc = Instant::now();
             let url = format!(
-                "https://photos.google.com/_/PhotosUi/data/batchexecute?rpcids={rpcid}&source-path=%2F&f.sid={}&bl={}&rt=c",
-                self.fsid, self.bl
+                "https://photos.google.com{}/data/batchexecute?rpcids={rpcid}&source-path={}/&f.sid={}&bl={}&rt=c",
+                self.rpc_path,
+                &self.base["https://photos.google.com".len()..],
+                self.fsid,
+                self.bl
             );
             let at = self.at.clone();
             let res = match self.fetch(&url, Some(&[("f.req", &freq), ("at", &at)])).await {
@@ -197,7 +212,11 @@ impl Client {
             };
             match res {
                 Ok(v) => return Ok(v),
+                Err(e) if e.is::<Fatal>() => return Err(e),
                 Err(e) => last = e,
+            }
+            if attempt == 4 {
+                break;
             }
             let backoff = Duration::from_secs(2u64.pow(attempt));
             eprintln!("{rpcid} attempt {attempt} failed: {last:#}; retrying in {backoff:?}");
@@ -241,7 +260,14 @@ impl Client {
             .ok_or_else(|| anyhow!("no download URL for {key}"))?
             .to_string();
         let live = ext(&info[0]).and_then(|e| e.get("146008172")?[3].as_str().map(String::from));
-        let full = self.rpc("fDcn4b", json!([key, 1, null, null, 1])).await?;
+        // Metadata only, and fails for items not in your library (e.g. from shared albums): don't lose the download over it.
+        let full = match self.rpc("fDcn4b", json!([key, 1, null, null, 1])).await {
+            Err(e) if !e.is::<Fatal>() => {
+                eprintln!("{key}: no extended info ({e:#}), using fallback name");
+                Value::Null
+            }
+            r => r?,
+        };
         Ok((url, live, full))
     }
 }
@@ -278,7 +304,8 @@ pub fn wiz_global_data(html: &str) -> Option<Value> {
 /// Pull the `wrb.fr` envelope for `rpcid` out of a `)]}'`-prefixed batchexecute body and decode
 /// its double-encoded payload.
 pub fn parse_batch(body: &str, rpcid: &str) -> Result<Value> {
-    if body.contains("unusual traffic") || body.contains("g-recaptcha") {
+    // Only non-batchexecute bodies: a real payload can contain these words in a user's photo description.
+    if !body.starts_with(")]}'") && (body.contains("unusual traffic") || body.contains("g-recaptcha")) {
         Err(Fatal::Blocked("captcha page".into()))?
     }
     for line in body.lines().filter(|l| l.contains("wrb.fr")) {

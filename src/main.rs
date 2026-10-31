@@ -8,6 +8,8 @@ use futures_util::StreamExt;
 use gphotos::{Client, Fatal, Jar};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -42,9 +44,13 @@ async fn run() -> Result<()> {
 
     // Overlapping cron runs would double-download; the OS drops this lock if we're killed.
     let lock = std::fs::File::create(data.join(".lock"))?;
-    if lock.try_lock().is_err() {
-        eprintln!("another run holds {}, exiting", data.join(".lock").display());
-        return Ok(());
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!("another run holds {}, exiting", data.join(".lock").display());
+            return Ok(());
+        }
+        Err(e) => return Err(e).context("locking .lock"),
     }
 
     // Google rotates session cookies; we save the rotated jar and prefer it while it's newer than the input.
@@ -56,7 +62,11 @@ async fn run() -> Result<()> {
     let mut db = Db::open(&data.join("state.db"))?;
     let mut gp = Client::new(jar, account, delay).await?;
     let res = sync(&mut gp, &mut db, &data).await;
-    std::fs::write(&saved, gp.jar.dump())?;
+    // Write-then-rename: a kill mid-write must not leave a truncated jar that's newer than the input.
+    // 0600: these cookies are full access to the Google account.
+    let tmp = data.join("cookies.txt.tmp");
+    std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?.write_all(gp.jar.dump().as_bytes())?;
+    std::fs::rename(&tmp, &saved)?;
     let (total, done) = db.counts()?;
     eprintln!("{done}/{total} items backed up");
     res
@@ -65,10 +75,16 @@ async fn run() -> Result<()> {
 async fn sync(gp: &mut Client, db: &mut Db, data: &Path) -> Result<()> {
     index_library(gp, db).await?;
     if env("GPS_ALBUMS", "1") == "1" {
-        index_albums(gp, db).await?;
+        // One broken (e.g. shared) album must not block every backup run.
+        match index_albums(gp, db).await {
+            Err(e) if !e.is::<Fatal>() => eprintln!("album indexing failed, continuing: {e:#}"),
+            r => r?,
+        }
     }
-    download(gp, db, data).await?;
-    link_albums(db, data)
+    // Link even when downloads stop early (block, or a tail of permanently failing items).
+    let res = download(gp, db, data).await;
+    link_albums(db, data)?;
+    res
 }
 
 /// Page the whole library into the DB, checkpointing the page token so a stopped run resumes mid-listing.
@@ -122,15 +138,15 @@ async fn index_albums(gp: &mut Client, db: &mut Db) -> Result<()> {
 }
 
 async fn download(gp: &mut Client, db: &mut Db, data: &Path) -> Result<()> {
+    // Items that failed this run; they stay pending, so over-fetch by that many to always see untried ones.
     let mut tried = HashSet::new();
     let mut consecutive_failures = 0;
     loop {
-        let batch: Vec<_> = db.pending(200)?.into_iter().filter(|i| !tried.contains(&i.key)).collect();
+        let batch: Vec<_> = db.pending(200 + tried.len())?.into_iter().filter(|i| !tried.contains(&i.key)).collect();
         if batch.is_empty() {
             return Ok(());
         }
         for item in batch {
-            tried.insert(item.key.clone());
             match download_one(gp, &item, data).await {
                 Ok(path) => {
                     consecutive_failures = 0;
@@ -140,6 +156,7 @@ async fn download(gp: &mut Client, db: &mut Db, data: &Path) -> Result<()> {
                 Err(e) if e.is::<Fatal>() => return Err(e),
                 Err(e) => {
                     eprintln!("failed {}: {e:#}", item.key);
+                    tried.insert(item.key.clone());
                     db.mark_failed(&item.key, &format!("{e:#}"))?;
                     consecutive_failures += 1;
                     if consecutive_failures >= 20 {
@@ -192,6 +209,10 @@ async fn fetch_to(gp: &mut Client, url: &str, path: &Path) -> Result<u64> {
     let resp = gp.fetch(url, None).await?;
     if !resp.status().is_success() {
         bail!("HTTP {} downloading {url}", resp.status());
+    }
+    // An expired URL or interstitial can come back as a 200 HTML page (even via photos.google.com).
+    if resp.headers().get(reqwest::header::CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"text/html")) {
+        bail!("got HTML instead of media from {}", resp.url());
     }
     let part = PathBuf::from(format!("{}.part", path.display()));
     let mut f = tokio::fs::File::create(&part).await?;
