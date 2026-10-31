@@ -61,7 +61,13 @@ async fn run() -> Result<()> {
 
     let mut db = Db::open(&data.join("state.db"))?;
     let mut gp = Client::new(jar, account, delay).await?;
-    let res = sync(&mut gp, &mut db, &data).await;
+    // docker stop / cron timeout send SIGTERM: stop syncing but still save the rotated cookies below.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let res = tokio::select! {
+        r = sync(&mut gp, &mut db, &data) => r,
+        _ = term.recv() => Err(anyhow::anyhow!("terminated, will resume next run")),
+        _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!("interrupted, will resume next run")),
+    };
     // Write-then-rename: a kill mid-write must not leave a truncated jar that's newer than the input.
     // 0600: these cookies are full access to the Google account.
     let tmp = data.join("cookies.txt.tmp");
@@ -228,14 +234,21 @@ async fn fetch_to(gp: &mut Client, url: &str, path: &Path) -> Result<u64> {
     Ok(n)
 }
 
-/// albums/<title>/<file> symlinks into media/, rebuilt each run.
+/// albums/<title>/<file> symlinks into media/, rebuilt from scratch each run so renames/removals don't leave stale links.
 fn link_albums(db: &Db, data: &Path) -> Result<()> {
     let albums = data.join("albums");
+    if albums.exists() {
+        std::fs::remove_dir_all(&albums)?;
+    }
     for (key, title, path) in db.album_links()? {
         let dir = albums.join(format!("{} [{}]", sanitize(&title), &key[key.len().saturating_sub(6)..]));
         std::fs::create_dir_all(&dir)?;
-        let file = Path::new(&path).file_name().context("bad path")?;
-        let link = dir.join(file);
+        let file = Path::new(&path).file_name().context("bad path")?.to_string_lossy();
+        let mut link = dir.join(&*file);
+        if link.symlink_metadata().is_ok() {
+            // Same filename from different months: disambiguate with the month dir.
+            link = dir.join(format!("{}_{file}", path.split('/').skip(1).take(2).collect::<Vec<_>>().join("-")));
+        }
         if link.symlink_metadata().is_err() {
             std::os::unix::fs::symlink(Path::new("../..").join(&path), &link)?;
         }
@@ -243,8 +256,20 @@ fn link_albums(db: &Db, data: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Safe single path component, capped well under the 255-byte filename limit (room for suffixes and `.json`).
 fn sanitize(s: &str) -> String {
-    s.chars().map(|c| if c == '/' || c == '\0' || c.is_control() { '_' } else { c }).collect::<String>().trim_start_matches('.').trim().to_string()
+    let s: String = s.chars().map(|c| if c == '/' || c == '\0' || c.is_control() { '_' } else { c }).collect();
+    let s = s.trim_start_matches('.').trim();
+    if s.len() <= 180 {
+        return s.to_string();
+    }
+    // Keep the extension when truncating.
+    let (stem, ext) = s.rsplit_once('.').filter(|(_, e)| e.len() <= 10).unwrap_or((s, ""));
+    let mut end = 180 - ext.len() - 1;
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    if ext.is_empty() { stem[..end].to_string() } else { format!("{}.{ext}", &stem[..end]) }
 }
 
 /// `name` in dir unless another item already claimed it (via its sidecar); then insert the key tail.
@@ -284,6 +309,8 @@ mod tests {
         assert_eq!(year_month(951_782_400_000), (2000, 2)); // 2000-02-29
         assert_eq!(year_month(-1), (1969, 12));
         assert_eq!(sanitize("../a/b.jpg"), "_a_b.jpg");
+        let long = sanitize(&format!("{}.jpeg", "é".repeat(200)));
+        assert!(long.len() <= 180 && long.ends_with(".jpeg"), "{long}");
         let t = std::env::temp_dir().join(format!("gps-test-{}", std::process::id()));
         std::fs::create_dir_all(t.join("d")).unwrap();
         assert_eq!(unique(&t, "d", "x.jpg", "AF1Qip12345678"), "d/x.jpg");

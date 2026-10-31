@@ -9,7 +9,6 @@ pub struct Db(Connection);
 pub struct Item {
     pub key: String,
     pub ts_ms: i64,
-    pub url: String,
     pub is_video: bool,
     pub meta: String,
 }
@@ -21,7 +20,7 @@ impl Db {
             "PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;
              CREATE TABLE IF NOT EXISTS items(
-               key TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL, url TEXT NOT NULL,
+               key TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL,
                is_video INTEGER NOT NULL, meta TEXT NOT NULL,
                path TEXT, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT);
              CREATE INDEX IF NOT EXISTS items_pending ON items(path) WHERE path IS NULL;
@@ -45,22 +44,22 @@ impl Db {
     }
 
     /// Upsert a page of items in one transaction. Returns how many were new.
-    /// The URL and metadata are refreshed on every sighting (base URLs expire); download state is kept.
+    /// Metadata is refreshed on every sighting; download state is kept.
     pub fn upsert_items(&mut self, items: &[Item]) -> Result<usize> {
         let tx = self.0.transaction()?;
         let mut new = 0;
         {
             let mut exists = tx.prepare_cached("SELECT 1 FROM items WHERE key=?")?;
             let mut up = tx.prepare_cached(
-                "INSERT INTO items(key, ts_ms, url, is_video, meta) VALUES(?,?,?,?,?)
-                 ON CONFLICT(key) DO UPDATE SET url=excluded.url, meta=excluded.meta,
+                "INSERT INTO items(key, ts_ms, is_video, meta) VALUES(?,?,?,?)
+                 ON CONFLICT(key) DO UPDATE SET meta=excluded.meta,
                    ts_ms=excluded.ts_ms, is_video=excluded.is_video",
             )?;
             for i in items {
                 if !exists.exists([&i.key])? {
                     new += 1;
                 }
-                up.execute(params![i.key, i.ts_ms, i.url, i.is_video, i.meta])?;
+                up.execute(params![i.key, i.ts_ms, i.is_video, i.meta])?;
             }
         }
         tx.commit()?;
@@ -91,11 +90,11 @@ impl Db {
     /// Items not yet on disk, fewest attempts first, so one poison item can't starve the rest.
     pub fn pending(&self, limit: usize) -> Result<Vec<Item>> {
         let mut st = self.0.prepare_cached(
-            "SELECT key, ts_ms, url, is_video, meta FROM items WHERE path IS NULL
+            "SELECT key, ts_ms, is_video, meta FROM items WHERE path IS NULL
              ORDER BY attempts, ts_ms DESC LIMIT ?",
         )?;
         let rows = st.query_map([limit as i64], |r| {
-            Ok(Item { key: r.get(0)?, ts_ms: r.get(1)?, url: r.get(2)?, is_video: r.get(3)?, meta: r.get(4)? })
+            Ok(Item { key: r.get(0)?, ts_ms: r.get(1)?, is_video: r.get(2)?, meta: r.get(3)? })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -136,7 +135,7 @@ mod tests {
     #[test]
     fn resume_state() {
         let mut db = Db::open(Path::new(":memory:")).unwrap();
-        let it = |k: &str| Item { key: k.into(), ts_ms: 1, url: "u".into(), is_video: false, meta: "{}".into() };
+        let it = |k: &str| Item { key: k.into(), ts_ms: 1, is_video: false, meta: "{}".into() };
         assert_eq!(db.upsert_items(&[it("a"), it("b")]).unwrap(), 2);
         assert_eq!(db.upsert_items(&[it("a")]).unwrap(), 0);
         db.mark_failed("a", "boom").unwrap();

@@ -75,7 +75,11 @@ impl Jar {
                 .filter_map(|p| p.trim().split_once('='))
                 .find(|(k, _)| k.eq_ignore_ascii_case("domain"))
                 .map_or(host, |(_, d)| d);
-            self.put(domain, n, v);
+            // A host may only set cookies for itself or a parent domain (RFC 6265 5.3).
+            let d = domain.trim_start_matches('.');
+            if host == d || host.ends_with(&format!(".{d}")) {
+                self.put(domain, n, v);
+            }
         }
     }
 }
@@ -170,6 +174,9 @@ impl Client {
             }
             let loc = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok()).unwrap_or_default();
             url = url.join(loc)?;
+            if url.scheme() != "https" {
+                bail!("refusing non-https redirect to {url}"); // would leak cookies in cleartext
+            }
             let u = url.as_str();
             if u.contains("google.com/sorry") {
                 Err(Fatal::Blocked(u.into()))?
@@ -284,7 +291,6 @@ fn next(v: &Value) -> Option<String> {
 pub fn parse_item(rec: &Value) -> Option<Item> {
     Some(Item {
         key: rec[0].as_str()?.into(),
-        url: rec[1][0].as_str()?.into(),
         ts_ms: rec[2].as_i64()?,
         is_video: ext(rec).is_some_and(|e| e.contains_key("76647426")),
         meta: rec.to_string(),
