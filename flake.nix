@@ -17,6 +17,11 @@
           version = "0.1.0";
           src = p.lib.cleanSource ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          # Cross builds from macOS: build scripts run on darwin and link -liconv.
+          env = p.lib.optionalAttrs p.stdenv.buildPlatform.isDarwin {
+            # ponytail: env name of the build-platform ld wrapper; depsBuildBuild didn't reach build scripts.
+            "NIX_LDFLAGS_${p.buildPackages.stdenv.cc.suffixSalt}" = "-L${p.buildPackages.libiconv}/lib";
+          };
         };
         mkImage = lp: let app = mkApp lp; in lp.dockerTools.buildLayeredImage {
           name = "gphotosync";
