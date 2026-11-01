@@ -27,8 +27,11 @@ fn env(k: &str, default: &str) -> String {
 
 #[tokio::main]
 async fn main() {
-    let res = if std::env::args().nth(1).as_deref() == Some("status") {
+    let args: Vec<String> = std::env::args().collect();
+    let res = if args.get(1).map(String::as_str) == Some("status") {
         status()
+    } else if args.get(1).map(String::as_str) == Some("debug-rpc") && args.len() > 3 {
+        debug_rpc(&args[2], &args[3]).await
     } else {
         run().await
     };
@@ -234,6 +237,31 @@ async fn sync(gp: &mut Client, db: &mut Db, data: &Path, st: &mut Stats) -> Resu
         }
     }
     res
+}
+
+/// `gphotosync debug-rpc <rpcid> '<json payload>'`: print one raw RPC response, to diagnose Google format changes.
+/// Read-only RPCs only in practice; it sends whatever you give it. Doesn't take the lock or touch state.db.
+async fn debug_rpc(rpcid: &str, payload: &str) -> Result<()> {
+    let data = PathBuf::from(env("GPS_DATA", "./backup"));
+    let saved = data.join("cookies.txt");
+    let src = if saved.exists() {
+        saved
+    } else {
+        PathBuf::from(env("GPS_COOKIES", "./cookies.txt"))
+    };
+    let jar = Jar::parse(
+        &std::fs::read_to_string(&src).with_context(|| format!("reading {}", src.display()))?,
+    );
+    let account: u32 = env("GPS_ACCOUNT", "0").parse().context("GPS_ACCOUNT")?;
+    let mut gp = Client::new(jar, account, Duration::from_millis(500)).await?;
+    let v = gp
+        .rpc(
+            rpcid,
+            serde_json::from_str(payload).context("payload must be JSON")?,
+        )
+        .await?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
 }
 
 /// Page the whole library into the DB, checkpointing the page token so a stopped run resumes mid-listing.

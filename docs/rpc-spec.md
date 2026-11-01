@@ -313,7 +313,13 @@ The precise difference between `[1]` and `[7]` is **[UNCERTAIN]**. The names sug
 unmodified upload, while `[1]` is the "Download" button result, which for edited items is the edited
 version. Take the filename from `fDcn4b d[2]` or `EWgK9e [1][3]`, and check the length against `size`.
 
-### 3.2 `pLFTfd`: signed download URL (sources disagree on the payload) **[UNCERTAIN]**
+### 3.2 `pLFTfd`: signed download URL. **Verified 2026-11-01 for videos**
+VrseUb returns neither `[1]` nor `[7]` for videos. `pLFTfd` with `[[mediaKey],[1]]` (also tested: `[[k],null,null]`
+and `[[k],null,null,1]`) returns `["https://video-downloads.googleusercontent.com/..."]`. Fetching that URL with the
+cookies gives 200 `video/mp4`, `Content-Disposition: attachment; filename="<original name>"`, and a byte count
+equal to ext `318563170[0][1]`. Without cookies, the response is 200 with an empty body.
+
+Earlier notes, from before verification:
 | source | payload | claim |
 |---|---|---|
 | GPTK `getDownloadUrl` | `[mediaKeyArray, null, authKey]`, returns `response[0]` | none |

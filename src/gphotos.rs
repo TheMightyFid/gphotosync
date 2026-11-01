@@ -362,11 +362,19 @@ impl Client {
         let info = self
             .rpc("VrseUb", json!([key, null, null, null, null]))
             .await?;
-        let url = [&info[7], &info[1]]
+        let url = match [&info[7], &info[1]]
             .into_iter()
             .find_map(|v| v.as_str().filter(|s| s.starts_with("https://")))
-            .ok_or_else(|| anyhow!("no download URL for {key}"))?
-            .to_string();
+        {
+            Some(u) => u.to_string(),
+            // Videos get no URL in VrseUb; pLFTfd returns a video-downloads.googleusercontent.com link to the
+            // original bytes (verified 2026-11-01: size matches ext 318563170, Content-Disposition has the filename).
+            None => self.rpc("pLFTfd", json!([[key], [1]])).await?[0]
+                .as_str()
+                .filter(|s| s.starts_with("https://"))
+                .ok_or_else(|| anyhow!("no download URL for {key}"))?
+                .to_string(),
+        };
         let live = ext(&info[0]).and_then(|e| e.get("146008172")?[3].as_str().map(String::from));
         // Metadata only, and fails for items not in your library (e.g. from shared albums): don't lose the download over it.
         let full = match self.rpc("fDcn4b", json!([key, 1, null, null, 1])).await {
