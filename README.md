@@ -38,6 +38,9 @@ Without Docker: `nix run . ` or `cargo run --release`.
 | `GPS_ACCOUNT` | `0` | `/u/N/` account index when several are signed in |
 | `GPS_DELAY_MS` | `500` | base gap between RPCs (randomised 0.6-1.8x) |
 | `GPS_ALBUMS` | `1` | set to `0` to skip album indexing |
+| `GPS_IMMICH_URL` | unset | e.g. `http://192.168.1.226:2283`. Enables the Immich album sync (see below) |
+| `GPS_IMMICH_API_KEY` | unset | Immich API key (Account Settings → API Keys) |
+| `GPS_IMMICH_PATH` | `/gphotosync/media` | where Immich's container sees this backup's `media/` folder |
 | `GPS_MAX_ITEMS` | `2000` | max downloads per run (`0` = unlimited); spreads a big first sync over several nights |
 
 ## Output
@@ -102,6 +105,29 @@ is safe. A `.lock` file stops overlapping cron runs.
 
 Items that fail are retried on later runs, after the ones that have never been tried. `sqlite3 state.db
 "select key,attempts,last_error from items where path is null and attempts>0"` lists them.
+
+## Immich
+
+Immich doesn't turn folders into albums, so gphotosync can create the albums for you over Immich's API.
+This never touches any files.
+
+1. In Immich's container settings, add a **read-only** path mapping: host `<your Backup path>` to container `/gphotosync`.
+2. In Immich, go to **Administration → External Libraries** and create a library with the import path **`/gphotosync/media`**.
+   Use `media/` only. Importing `albums/` as well would import a second copy of every album photo.
+3. In Immich, go to **Account Settings → API Keys** and create a key with at least `asset.read`, `album.read`,
+   `album.create` and `albumAsset.create`, or use an all-permissions key.
+4. Set `GPS_IMMICH_URL`, `GPS_IMMICH_API_KEY` and, if your mapping differs, `GPS_IMMICH_PATH`.
+
+At the end of each run, gphotosync does the following:
+- It finds each downloaded photo in Immich by its path.
+- It creates any missing albums. An album that already exists with the same name is reused.
+- It adds the photos to their albums.
+
+It remembers which Immich album belongs to which Google album, so renaming an album in Immich is fine.
+
+Photos only join an album after Immich has scanned them. The log reports these as "not in Immich yet", and
+they're added on the next run. Set the external library to rescan on a schedule (Immich does this daily by default).
+If Immich is down, the run logs it and carries on.
 
 ## Avoiding blocks
 

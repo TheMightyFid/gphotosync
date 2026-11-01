@@ -7,6 +7,7 @@ macro_rules! log {
 
 mod db;
 mod gphotos;
+mod immich;
 
 use anyhow::{Context, Result, bail};
 use db::Db;
@@ -221,6 +222,17 @@ async fn sync(gp: &mut Client, db: &mut Db, data: &Path, st: &mut Stats) -> Resu
     log!("== downloading");
     let res = download(gp, db, data, st).await;
     link_albums(db, data)?;
+    let url = env("GPS_IMMICH_URL", "");
+    if !url.is_empty() {
+        log!("== syncing albums to Immich");
+        let key = std::env::var("GPS_IMMICH_API_KEY")
+            .context("GPS_IMMICH_URL is set but GPS_IMMICH_API_KEY isn't")?;
+        let im = immich::Immich::new(&url, &key, &env("GPS_IMMICH_PATH", "/gphotosync/media"))?;
+        // Immich being down must never fail the backup itself.
+        if let Err(e) = im.sync_albums(db).await {
+            log!("immich album sync failed, retried next run: {e:#}");
+        }
+    }
     res
 }
 
