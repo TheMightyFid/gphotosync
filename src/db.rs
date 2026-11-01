@@ -116,6 +116,15 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Done items whose file is named after their media key (no original filename was known).
+    pub fn fallback_named(&self) -> Result<Vec<(String, String)>> {
+        let mut st = self.0.prepare(
+            "SELECT key, path FROM items WHERE path LIKE '%/' || key || '.%' AND path NOT LIKE '%.live.mov'",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     pub fn mark_done(&self, key: &str, path: &str) -> Result<()> {
         self.0.execute(
             "UPDATE items SET path=?, last_error=NULL WHERE key=?",
@@ -201,6 +210,11 @@ mod tests {
         db.mark_failed("a", "boom").unwrap();
         assert_eq!(db.pending(10).unwrap()[0].key, "b"); // failed item goes last
         db.mark_done("b", "x.jpg").unwrap();
+        db.mark_done("a", "media/2024/05/a.jpg").unwrap();
+        assert_eq!(db.fallback_named().unwrap(), vec![("a".into(), "media/2024/05/a.jpg".into())]);
+        db.mark_done("a", "media/2024/05/IMG_1.jpg").unwrap();
+        assert!(db.fallback_named().unwrap().is_empty());
+        db.0.execute("UPDATE items SET path=NULL, last_error='boom' WHERE key='a'", []).unwrap();
         db.upsert_items(&[it("b")]).unwrap(); // re-sighting must not reset download state
         assert_eq!(db.counts().unwrap(), (2, 1));
         assert_eq!(db.failing().unwrap(), 1);

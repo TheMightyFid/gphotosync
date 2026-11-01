@@ -222,6 +222,7 @@ async fn sync(gp: &mut Client, db: &mut Db, data: &Path, st: &mut Stats) -> Resu
         }
     }
     // Link even when downloads stop early (block, or a tail of permanently failing items).
+    rename_fallbacks(gp, db, data).await?;
     log!("== downloading");
     let res = download(gp, db, data, st).await;
     link_albums(db, data)?;
@@ -357,11 +358,11 @@ async fn download(gp: &mut Client, db: &mut Db, data: &Path, st: &mut Stats) -> 
                     consecutive_failures = 0;
                     db.mark_done(&item.key, &path)?;
                     (done, st.items, st.bytes) = (done + 1, st.items + 1, st.bytes + size);
-                    let (rate, eta) = rate_eta(
-                        st.items,
-                        (total - done).max(0) as u64,
-                        t0.elapsed().as_secs(),
-                    );
+                    let mut left = (total - done).max(0) as u64;
+                    if max_items > 0 {
+                        left = left.min(max_items.saturating_sub(st.items));
+                    }
+                    let (rate, eta) = rate_eta(st.items, left, t0.elapsed().as_secs());
                     log!(
                         "[{done}/{total} {:.1}%] saved {path} ({}) - {rate} items/h, ETA {eta} this run",
                         pct(done, total),
@@ -390,17 +391,15 @@ async fn download(gp: &mut Client, db: &mut Db, data: &Path, st: &mut Stats) -> 
 async fn download_one(gp: &mut Client, item: &db::Item, data: &Path) -> Result<(String, u64)> {
     let (url, live, full) = gp.item_urls(&item.key).await?;
     let d = &full[0];
-    let name = d[2]
-        .as_str()
-        .map(sanitize)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            format!(
-                "{}.{}",
-                sanitize(&item.key),
-                if item.is_video { "mp4" } else { "jpg" }
-            )
-        });
+    // Open the download first: for album-only items Google gives no metadata, and the original
+    // filename is only in the response's Content-Disposition.
+    let resp = open_media(gp, &url).await?;
+    let name = [d[2].as_str().map(String::from), disposition_name(&resp)]
+        .into_iter()
+        .flatten()
+        .map(|n| sanitize(&n))
+        .find(|n| !n.is_empty())
+        .unwrap_or_else(|| fallback_name(item));
     let (y, m) = year_month(item.ts_ms);
     let dir = format!("media/{y:04}/{m:02}");
     std::fs::create_dir_all(data.join(&dir))?;
@@ -415,7 +414,7 @@ async fn download_one(gp: &mut Client, item: &db::Item, data: &Path) -> Result<(
         data.join(format!("{rel}.json")),
         serde_json::to_vec_pretty(&sidecar)?,
     )?;
-    let mut size = fetch_to(gp, &url, &data.join(&rel)).await?;
+    let mut size = save(resp, &data.join(&rel)).await?;
     if let Some(expect) = d[5].as_u64()
         && expect != size
     {
@@ -432,8 +431,8 @@ fn raw(s: &str) -> Value {
     serde_json::from_str(s).unwrap_or(Value::Null)
 }
 
-/// Stream to `<path>.part` then rename, so a killed run never leaves a truncated file that looks complete.
-async fn fetch_to(gp: &mut Client, url: &str, path: &Path) -> Result<u64> {
+/// GET a media URL, refusing error pages (and treating a captcha page as a block).
+async fn open_media(gp: &mut Client, url: &str) -> Result<reqwest::Response> {
     let resp = gp.fetch(url, None).await?;
     if !resp.status().is_success() {
         bail!("HTTP {} downloading {url}", resp.status());
@@ -459,6 +458,16 @@ async fn fetch_to(gp: &mut Client, url: &str, path: &Path) -> Result<u64> {
         }
         bail!("got HTML instead of media from {url}");
     }
+    Ok(resp)
+}
+
+async fn fetch_to(gp: &mut Client, url: &str, path: &Path) -> Result<u64> {
+    let resp = open_media(gp, url).await?;
+    save(resp, path).await
+}
+
+/// Stream to `<path>.part` then rename, so a killed run never leaves a truncated file that looks complete.
+async fn save(resp: reqwest::Response, path: &Path) -> Result<u64> {
     let part = PathBuf::from(format!("{}.part", path.display()));
     let mut f = tokio::fs::File::create(&part).await?;
     let mut n = 0u64;
@@ -471,6 +480,109 @@ async fn fetch_to(gp: &mut Client, url: &str, path: &Path) -> Result<u64> {
     f.sync_all().await?;
     tokio::fs::rename(&part, path).await?;
     Ok(n)
+}
+
+/// Filename from `Content-Disposition: attachment; filename="x.jpg"` (or RFC 5987 `filename*=UTF-8''x.jpg`).
+fn disposition_name(resp: &reqwest::Response) -> Option<String> {
+    parse_disposition(
+        resp.headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)?
+            .to_str()
+            .ok()?,
+    )
+}
+
+fn parse_disposition(h: &str) -> Option<String> {
+    let mut plain = None;
+    for part in h.split(';').map(str::trim) {
+        if let Some(v) = part.strip_prefix("filename*=") {
+            let v = v.split_once("''").map_or(v, |(_, v)| v);
+            return Some(percent_decode(v));
+        }
+        if let Some(v) = part.strip_prefix("filename=") {
+            plain = Some(v.trim_matches('"').to_string());
+        }
+    }
+    plain
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let (mut out, mut i) = (Vec::new(), 0);
+    while i < b.len() {
+        match (
+            b[i],
+            b.get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()),
+        ) {
+            (b'%', Some(v)) => {
+                out.push(v);
+                i += 3;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn fallback_name(item: &db::Item) -> String {
+    format!(
+        "{}.{}",
+        sanitize(&item.key),
+        if item.is_video { "mp4" } else { "jpg" }
+    )
+}
+
+/// One-off repair: items saved under their media key (no filename was known) get renamed to the
+/// original filename from the download's Content-Disposition. Only renames; never deletes.
+async fn rename_fallbacks(gp: &mut Client, db: &mut Db, data: &Path) -> Result<()> {
+    let todo = db.fallback_named()?;
+    if todo.is_empty() {
+        return Ok(());
+    }
+    log!("== renaming {} files saved under media keys", todo.len());
+    let mut renamed = 0;
+    for (key, path) in todo {
+        let res: Result<Option<String>> = async {
+            let (url, _, _) = gp.item_urls(&key).await?;
+            let resp = open_media(gp, &url).await?;
+            Ok(disposition_name(&resp)
+                .map(|n| sanitize(&n))
+                .filter(|n| !n.is_empty()))
+            // resp dropped here without reading the body
+        }
+        .await;
+        let name = match res {
+            Ok(Some(n)) => n,
+            Ok(None) => continue,
+            Err(e) if e.is::<Fatal>() => return Err(e),
+            Err(e) => {
+                log!("rename {key}: {e:#}");
+                continue;
+            }
+        };
+        let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+        let new = unique(data, dir, &name, &key);
+        if new == path || data.join(&new).exists() {
+            continue;
+        }
+        std::fs::rename(data.join(&path), data.join(&new))?;
+        let (old_json, new_json) = (
+            data.join(format!("{path}.json")),
+            data.join(format!("{new}.json")),
+        );
+        if old_json.exists() {
+            std::fs::rename(old_json, new_json)?;
+        }
+        db.mark_done(&key, &new)?;
+        renamed += 1;
+        log!("renamed {path} -> {new}");
+    }
+    log!("renamed {renamed} files");
+    Ok(())
 }
 
 /// albums/<title>/<file> symlinks into media/, rebuilt from scratch each run so renames/removals don't leave stale links.
@@ -721,6 +833,16 @@ mod tests {
         assert_eq!(rate_eta(5, 10, 0), (18_000, "2s".into())); // sub-second start: no division by zero
         assert_eq!(rate_eta(41, 123, 3600), (41, "3h00m".into()));
         assert_eq!(pct(0, 0), 100.0);
+        assert_eq!(
+            parse_disposition(r#"attachment; filename="VID-20261027-WA0003.mp4""#).as_deref(),
+            Some("VID-20261027-WA0003.mp4")
+        );
+        assert_eq!(
+            parse_disposition("attachment; filename=\"a.jpg\"; filename*=UTF-8''caf%C3%A9 1.jpg")
+                .as_deref(),
+            Some("café 1.jpg")
+        );
+        assert_eq!(parse_disposition("inline"), None);
     }
 
     #[test]

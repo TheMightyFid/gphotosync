@@ -40,6 +40,16 @@ impl std::fmt::Display for Fatal {
 }
 impl std::error::Error for Fatal {}
 
+/// Google answered, with an error status (e.g. `[5]` = not found). Retrying won't change the answer.
+#[derive(Debug)]
+pub struct RpcRefused(pub String);
+impl std::fmt::Display for RpcRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for RpcRefused {}
+
 /// Netscape cookies.txt jar, keyed by (domain, name). Set-Cookie responses are merged back in.
 #[derive(Default)]
 pub struct Jar(Vec<(String, String, String)>);
@@ -293,7 +303,7 @@ impl Client {
             };
             match res {
                 Ok(v) => return Ok(v),
-                Err(e) if e.is::<Fatal>() => return Err(e),
+                Err(e) if e.is::<Fatal>() || e.is::<RpcRefused>() => return Err(e),
                 Err(e) => last = e,
             }
             if attempt == 4 {
@@ -378,8 +388,10 @@ impl Client {
         let live = ext(&info[0]).and_then(|e| e.get("146008172")?[3].as_str().map(String::from));
         // Metadata only, and fails for items not in your library (e.g. from shared albums): don't lose the download over it.
         let full = match self.rpc("fDcn4b", json!([key, 1, null, null, 1])).await {
+            // Expected for album-only items (not in your library); the filename then comes from the download.
+            Err(e) if e.is::<RpcRefused>() => Value::Null,
             Err(e) if !e.is::<Fatal>() => {
-                log!("{key}: no extended info ({e:#}), using fallback name");
+                log!("{key}: no extended info ({e:#})");
                 Value::Null
             }
             r => r?,
@@ -431,9 +443,9 @@ pub fn parse_batch(body: &str, rpcid: &str) -> Result<Value> {
         let v: Value = serde_json::from_str(line).context("bad batchexecute chunk")?;
         for env in v.as_array().into_iter().flatten() {
             if env[0] == "wrb.fr" && env[1] == rpcid {
-                let s = env[2]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("{rpcid}: empty result (error {})", env[5]))?;
+                let s = env[2].as_str().ok_or_else(|| {
+                    RpcRefused(format!("{rpcid}: empty result (error {})", env[5]))
+                })?;
                 return Ok(serde_json::from_str(s)?);
             }
         }
